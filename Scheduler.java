@@ -1,7 +1,15 @@
 package jay;
 
+import gnu.io.CommPortIdentifier;
+import gnu.io.PortInUseException;
+import gnu.io.SerialPort;
+import gnu.io.UnsupportedCommOperationException;
 import javafx.util.Pair;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.time.LocalDate;
 import java.util.*;
 import java.util.regex.Matcher;
@@ -10,13 +18,16 @@ import java.util.zip.CRC32;
 
 import static java.lang.System.exit;
 
-public class Main
+public class Scheduler
 {
     public static final int MAXPORT = 2;
     public static final int DSTOFFSET = 3600;
+    public static final int DATARATE = 115200;
+
     public static final String LENGTHPAT ="^((\\d+)h)?((\\d+)m)?$";
     public static final String TIMEPAT ="^([01]?[0-9]|2[0-3]):([0-5][0-9])$";
     public static final String DATEPAT ="^(\\d+)/(\\d+)$";
+    public static final String MSGPAT ="^(.*);(.*);(ts\\d+);$";
 
     public static final List<Pair<String,String>> optEquivalence = new ArrayList<Pair<String, String>>()
     {{
@@ -41,6 +52,7 @@ public class Main
             put(11, 30);
             put(12, 31);
     }};
+
     public static boolean isoptValid(HashMap<String,String> argTable,String opt, boolean isLong)
     {
         boolean optexisted = false;
@@ -72,6 +84,147 @@ public class Main
             if(argTable.containsKey(equiname))optexisted=true;
         }
         return  optallowed && !optexisted;
+    }
+    public static void sendcmd(String cmd,String hash)
+    {
+        Enumeration portlistEnum = CommPortIdentifier.getPortIdentifiers();
+        List<Pair<String,CommPortIdentifier>> serialPorts = new ArrayList<Pair<String,CommPortIdentifier>>();
+        while (portlistEnum.hasMoreElements())
+        {
+            CommPortIdentifier x = (CommPortIdentifier) portlistEnum.nextElement();
+            if (x.getPortType() == CommPortIdentifier.PORT_SERIAL)
+            {
+                serialPorts.add(new Pair<String,CommPortIdentifier>(x.getName(),x));
+            }
+        }
+
+        if(serialPorts.isEmpty())
+        {
+            System.out.println("No available serial port detected");
+            System.exit(0);
+        }
+        else
+        {
+            if(serialPorts.size()==1)
+            {
+                System.out.println(serialPorts.size() + " port detected");
+                System.out.println("selecting " + serialPorts.get(0).getKey()+" ...");
+                if (communicate(serialPorts.get(0).getValue(),cmd,hash))System.out.println("Success");
+                else System.out.println("Fail");
+            }
+            else
+            {
+                System.out.println(serialPorts.size() + " ports detected");
+                System.out.print("select from ");
+                StringBuilder builder = new StringBuilder();
+                for (Pair<String,CommPortIdentifier> x : serialPorts)
+                {
+                    builder.append(x.getKey());
+                    builder.append(',');
+                }
+                builder.deleteCharAt(builder.length()-1);
+                System.out.print(builder.toString()+"\n");
+
+                Scanner reader = new Scanner(System.in);
+                while(true)
+                {
+                    String port;
+                    System.out.print("Specify Arduino port :");
+                    port = reader.nextLine();
+                    for(int i=0;i<serialPorts.size();i++)
+                    {
+                        if(port.equals(serialPorts.get(i).getKey()))
+                        {
+                            System.out.println("selecting " + port+" ...");
+                            if (communicate(serialPorts.get(i).getValue(),cmd,hash))System.out.println("Success");
+                            else System.out.println("Fail");
+                            return;
+                        }
+                    }
+                    System.out.println("invalid port");
+                }
+            }
+        }
+    }
+    public static boolean communicate(CommPortIdentifier x,String payload,String hash)
+    {
+        try
+        {
+            String[] t =payload.split(";");
+            String ts = t[t.length-1];
+            SerialPort port = (SerialPort)x.open("scheduler", 2000);
+            port.setSerialPortParams(DATARATE,
+                    SerialPort.DATABITS_8,
+                    SerialPort.STOPBITS_1,
+                    SerialPort.PARITY_NONE);
+            Thread.sleep(2200);
+            BufferedReader input = new BufferedReader(new InputStreamReader(port.getInputStream()));
+            OutputStream output = port.getOutputStream();
+            long tsbegin;
+            while (true)
+            {
+                tsbegin = System.currentTimeMillis();
+                output.write(hash.getBytes());
+                output.write(payload.getBytes());
+                output.write('\n');
+                output.flush();
+                String response;
+                String body;
+                while ((System.currentTimeMillis()-tsbegin)<1000 )
+                {
+                    CRC32 crc32 = new CRC32();
+                    long receivedhash;
+                    if(input.ready())
+                    {
+                        response = input.readLine();
+                        if(response.length()<16)break;
+                        receivedhash = Long.parseLong(response.substring(0,8),16);
+                        body = response.substring(8,response.length());
+                        crc32.update(body.getBytes());
+                        if(crc32.getValue()!=receivedhash)break;
+                        Pattern patx = Pattern.compile(MSGPAT);
+                        Matcher mx = patx.matcher(body);
+                        if (mx.find())
+                        {
+                            if(mx.group(3).equals(ts))
+                            {
+                                System.out.println(mx.group(2));
+                                input.close();
+                                output.close();
+                                port.close();
+                                if(mx.group(1).equals("ack"))return true;
+                                else return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (PortInUseException e)
+        {
+            System.out.println("Selected port is busy");
+            System.exit(1);
+        } catch (UnsupportedCommOperationException e) {
+            System.out.println("Unsupported Serial port setting");
+            System.exit(1);
+        } catch (InterruptedException e) {
+            System.out.println("Interrupted");
+            System.exit(1);
+        } catch (IOException e) {
+            System.out.println("I/O failed");
+            System.exit(1);
+        }
+        return false;
+    }
+    public static byte[] hexToByteArray(String s)
+    {
+        int len = s.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
+                    + Character.digit(s.charAt(i+1), 16));
+        }
+        return data;
     }
     public static void process(HashMap<String,String> argTable)
     {
@@ -249,11 +402,15 @@ public class Main
         builder.append("begin");
         builder.append(begin);
         builder.append(';');
+        builder.append("ts");
+        builder.append(System.currentTimeMillis());
+        builder.append(';');
         CRC32 crc32 = new CRC32();
         crc32.update(builder.toString().getBytes());
-        builder.insert(0,crc32.getValue());
+     //   builder.insert(0, crc32.getValue());
+//        byte[] hash = hexToByteArray(String.format("%08X", crc32.getValue()));
 
-        System.out.println(builder.toString());
+        sendcmd(builder.toString(),String.format("%08X", crc32.getValue()));
     }
     public static void main(String[] args) {
         HashMap<String, String> argTable = new HashMap<String, String>();
