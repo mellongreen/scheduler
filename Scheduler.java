@@ -10,24 +10,33 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
 import java.time.LocalDate;
 import java.util.*;
+//import java.util.logging.ConsoleHandler;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 
+import static java.lang.Math.round;
 import static java.lang.System.exit;
 
 public class Scheduler
 {
     public static final int MAXPORT = 2;
     public static final int DSTOFFSET = 3600;
-    public static final int DATARATE = 115200;
+    public static final int DATARATE = 14400;
+    public static final int MAXATTEMPT = 3;
+
 
     public static final String LENGTHPAT ="^((\\d+)h)?((\\d+)m)?$";
     public static final String TIMEPAT ="^([01]?[0-9]|2[0-3]):([0-5][0-9])$";
     public static final String DATEPAT ="^(\\d+)/(\\d+)$";
     public static final String MSGPAT ="^(.*);(.*);(ts\\d+);$";
+    public static final String RESPONSEREPPAT = "(.*)\\*(.*)\\*(.*)";
+    public static boolean sync = false;
+    public static boolean show = false;
 
     public static final List<Pair<String,String>> optEquivalence = new ArrayList<Pair<String, String>>()
     {{
@@ -36,6 +45,8 @@ public class Scheduler
             add(new Pair<String,String>("l","length"));
             add(new Pair<String,String>("s","show"));
             add(new Pair<String,String>("p","port"));
+            add(new Pair<String,String>("h","help"));
+            add(new Pair<String,String>("y","sync"));
         }};
     public static final HashMap<Integer,Integer> monthday = new HashMap<Integer,Integer>()
     {{
@@ -109,7 +120,7 @@ public class Scheduler
             {
                 System.out.println(serialPorts.size() + " port detected");
                 System.out.println("selecting " + serialPorts.get(0).getKey()+" ...");
-                if (communicate(serialPorts.get(0).getValue(),cmd,hash))System.out.println("Success");
+                if (communicate(serialPorts.get(0).getValue(),cmd,hash))System.out.println("Done");
                 else System.out.println("Fail");
             }
             else
@@ -136,7 +147,7 @@ public class Scheduler
                         if(port.equals(serialPorts.get(i).getKey()))
                         {
                             System.out.println("selecting " + port+" ...");
-                            if (communicate(serialPorts.get(i).getValue(),cmd,hash))System.out.println("Success");
+                            if (communicate(serialPorts.get(i).getValue(),cmd,hash))System.out.println("Done");
                             else System.out.println("Fail");
                             return;
                         }
@@ -153,6 +164,7 @@ public class Scheduler
             String[] t =payload.split(";");
             String ts = t[t.length-1];
             SerialPort port = (SerialPort)x.open("scheduler", 2000);
+            //port.setDTR(true);
             port.setSerialPortParams(DATARATE,
                     SerialPort.DATABITS_8,
                     SerialPort.STOPBITS_1,
@@ -161,60 +173,160 @@ public class Scheduler
             BufferedReader input = new BufferedReader(new InputStreamReader(port.getInputStream()));
             OutputStream output = port.getOutputStream();
             long tsbegin;
-            while (true)
+            StringBuilder builder =  new StringBuilder();
+            CRC32 crc = new CRC32();
+            int attempt =0;
+            tsbegin = System.currentTimeMillis();
+            Pattern patx = Pattern.compile(MSGPAT);
+
+            while ((System.currentTimeMillis()-tsbegin)<1000 )
             {
-                tsbegin = System.currentTimeMillis();
-                output.write(hash.getBytes());
-                output.write(payload.getBytes());
+                attempt++;
+                builder.setLength(0);
+                crc.reset();
+                System.out.print("Attempt #");
+                System.out.println(attempt);
+
+                if(sync)
+                {
+                    builder.append(payload);
+                    //builder.deleteCharAt(builder.length()-1);
+                    //builder.append();
+                    builder.append("systime");
+                    builder.append(round(System.currentTimeMillis() / 1000.0));
+                    builder.append(';');
+                    crc.update(builder.toString().getBytes());
+
+                    output.write(String.format("%08X", crc.getValue()).getBytes());
+                    output.write(builder.toString().getBytes());
+                }
+                else
+                {
+                    output.write(hash.getBytes());
+                    output.write(payload.getBytes());
+                }
                 output.write('\n');
                 output.flush();
+
                 String response;
                 String body;
-                while ((System.currentTimeMillis()-tsbegin)<1000 )
-                {
-                    CRC32 crc32 = new CRC32();
-                    long receivedhash;
-                    if(input.ready())
-                    {
-                        response = input.readLine();
-                        if(response.length()<16)break;
-                        receivedhash = Long.parseLong(response.substring(0,8),16);
-                        body = response.substring(8,response.length());
-                        crc32.update(body.getBytes());
-                        if(crc32.getValue()!=receivedhash)break;
-                        Pattern patx = Pattern.compile(MSGPAT);
-                        Matcher mx = patx.matcher(body);
-                        if (mx.find())
+
+                    //CRC32 crc32 = new CRC32();
+                 crc.reset();
+                long receivedhash;
+                System.out.println("waiting for input");
+                while(!input.ready());
+                    response = input.readLine();
+                    if(response.length()<=10){
+                        System.out.println("Corruption during transfer");
+                        if(attempt>=MAXATTEMPT)
                         {
-                            if(mx.group(3).equals(ts))
+                            input.close();
+                            output.close();
+                            port.close();
+                            System.out.println("Giving up ...");
+                            return false;
+                        }
+                        continue;
+                    }
+
+                    receivedhash = Long.parseLong(response.substring(0,8),16);
+                    body = response.substring(8,response.length());
+                    crc.update(body.getBytes());
+                    if(crc.getValue()!=receivedhash)
+                    {
+                        System.out.println("Corruption during transfer");
+                        if(attempt>=MAXATTEMPT)
+                        {
+                            input.close();
+                            output.close();
+                            port.close();
+                            System.out.println("Giving up ...");
+                            return false;
+                        }
+                        continue;
+                    }
+                    Matcher mx = patx.matcher(body);
+                    if (mx.find() && mx.group(3).equals(ts))
+                    {
+                            System.out.println(processResponse(mx.group(2)));
+                            input.close();
+                            output.close();
+                            port.close();
+                            if(mx.group(1).equals("ack"))return true;
+                            else if(mx.group(1).equals("nak"))return false;
+                            else
                             {
-                                System.out.println(mx.group(2));
-                                input.close();
-                                output.close();
-                                port.close();
-                                if(mx.group(1).equals("ack"))return true;
-                                else return false;
+                                System.out.println("ACK not received");
+                                if(attempt>=MAXATTEMPT)
+                                {
+                                    input.close();
+                                    output.close();
+                                    port.close();
+                                    System.out.println("Giving up ...");
+                                    return false;
+                                }
                             }
+                    }
+                    else
+                    {
+                        System.out.println("Illegal response received");
+                        if(attempt>=MAXATTEMPT)
+                        {
+                            input.close();
+                            output.close();
+                            port.close();
+                            System.out.println("Giving up ...");
+                            return false;
                         }
                     }
-                }
+
+
             }
+            input.close();
+            output.close();
+            port.close();
+            System.out.println("Timeout");
+            return false;
         }
         catch (PortInUseException e)
         {
-            System.out.println("Selected port is busy");
-            System.exit(1);
+            System.err.println("Selected port is busy");
+            return false;
         } catch (UnsupportedCommOperationException e) {
-            System.out.println("Unsupported Serial port setting");
-            System.exit(1);
+            System.err.println("Unsupported Serial port setting");
+            return false;
         } catch (InterruptedException e) {
-            System.out.println("Interrupted");
-            System.exit(1);
+            System.err.println("Interrupted");
+            return false;
         } catch (IOException e) {
-            System.out.println("I/O failed");
-            System.exit(1);
+            System.err.println("I/O failed");
+            return false;
         }
-        return false;
+    }
+    public static String processResponse(String x)
+    {
+        Pattern pat = Pattern.compile(RESPONSEREPPAT);
+        StringBuilder builder = new StringBuilder();
+        String xxx[] = x.split("\\\\");
+        Matcher y;
+        for(String line:xxx)
+        {
+            y = pat.matcher(line);
+            if (y.find())
+            {
+                builder.append(y.group(1));
+                Date date = new Date(Integer.parseInt(y.group(2)) * 1000L);
+                DateFormat format = new SimpleDateFormat("dd/MM HH:mm");
+                format.setTimeZone(Calendar.getInstance().getTimeZone());
+                builder.append(format.format(date));
+                builder.append(y.group(3));
+            }
+            else builder.append(line);
+            builder.append('\n');
+        }
+        if(builder.length()!=0)builder.deleteCharAt(builder.length()-1);
+        return builder.toString();
     }
     public static byte[] hexToByteArray(String s)
     {
@@ -226,37 +338,84 @@ public class Scheduler
         }
         return data;
     }
-    public static void process(HashMap<String,String> argTable)
-    {
-        if(!argTable.containsKey("time"))
+    public static void process(HashMap<String,String> argTable) {
+
+        if(!argTable.containsKey("sync") && !argTable.containsKey("help") && !argTable.containsKey("show"))
         {
+            if (!argTable.containsKey("time")) {
             System.err.println("time must be specified");
             System.exit(1);
         }
-        if(!argTable.containsKey("length"))
-        {
+        if (!argTable.containsKey("length")) {
             System.err.println("length must be specified");
             System.exit(1);
         }
-        if(!argTable.containsKey("port"))
-        {
+        if (!argTable.containsKey("port")) {
             System.err.println("port must be specified");
             System.exit(1);
         }
-        if(!argTable.containsKey("date"))
-        {
-            argTable.put("date","today");
+        if (!argTable.containsKey("date")) {
+            argTable.put("date", "today");
+        }
         }
 
-        Set<String> args = argTable.keySet();
+        if (argTable.containsKey("show") && argTable.size() != 1)
+        {
+            System.err.println("`show` can only appear by itself");
+            return;
+        }
+        if(argTable.containsKey("help"))
+        {
+            if(argTable.size()==1)
+            {
+                System.out.print("-d --date        date (dd/MM or 'today' or 'tmr')\n" +
+                        "-t --time        time (hh:mm)\n" +
+                        "-l --length      length of time for which power should be on (*h*m)\n" +
+                        "-s --show        display all registered schedules\n" +
+                        "-p --port        power port\n" +
+                        "-h --help        display this page\n" +
+                        "-y --sync        sync unit with system time");
+
+            }
+            else {
+                System.err.println("`help` can only appear by itself");
+            }
+            return;
+        }
+
         StringBuilder builder = new StringBuilder();
-        boolean show = false;
+        if(argTable.containsKey("sync"))
+        {
+            if(argTable.size()==1)
+            {
+                sync=true;
+                builder.append("syn");
+                builder.append(';');
+            }
+            else
+            {
+                System.err.println("`sync` can only appear by itself");
+                return;
+            }
+        }
+        else if (argTable.containsKey("show"))
+        {
+            show=true;
+            builder.append("shw");
+            builder.append(';');
+        }
+        else
+        {
+            builder.append("sch");
+            builder.append(';');
+        }
+        Set<String> args = argTable.keySet();
+
         long begin = 0;
         for(String x: args)
         {
             if (x.equals("date"))
             {
-                if (show) throw new IllegalArgumentException("`show` can only appear by itself");
                 if (argTable.get(x).isEmpty()) throw new IllegalArgumentException("time must not be empty");
                 if (argTable.get(x).equals("today"))
                 {
@@ -300,7 +459,6 @@ public class Scheduler
             }
             else if (x.equals("time"))
             {
-                if (show) throw new IllegalArgumentException("`show` can only appear by itself");
                 if (argTable.get(x).isEmpty()) throw new IllegalArgumentException("time must not be empty");
                 if (argTable.get(x).equals("INDEF"))
                 {
@@ -332,7 +490,6 @@ public class Scheduler
             else if (x.equals("length"))
             {
                 try {
-                    if (show) throw new IllegalArgumentException("`show` can only appear by itself");
                     if (argTable.get(x).isEmpty()) throw new IllegalArgumentException("length must not be empty");
                     Pattern pat = Pattern.compile(LENGTHPAT);
                     Matcher m = pat.matcher(argTable.get(x));
@@ -365,14 +522,12 @@ public class Scheduler
             }
             else if (x.equals("show"))
             {
-                builder.append(x);
-                builder.append(';');
-                show = true;
+            //    builder.append(x);
+             //   builder.append(';');
             }
             else if (x.equals("port"))
             {
                 try {
-                    if (show) throw new IllegalArgumentException("`show` can only appear by itself");
                     int t = Integer.parseInt(argTable.get(x));
                     if (t <= 0 || t > MAXPORT) throw new IllegalArgumentException("Port does not exist (1-"+MAXPORT+")");
                     builder.append(x);
@@ -387,6 +542,10 @@ public class Scheduler
                 }
 
             }
+            else if (x.equals("sync"))
+            {
+            }
+
             else
             {
                 System.err.println("Invalid argTable");
@@ -399,20 +558,31 @@ public class Scheduler
         Date xc = new Date(begin*1000);
         if(tz.inDaylightTime(xc))
             begin -= DSTOFFSET;
-        builder.append("begin");
-        builder.append(begin);
-        builder.append(';');
+        if(!sync && !show)
+        {
+            builder.append("begin");
+            if(begin <= (System.currentTimeMillis()/1000)+ 5 )
+            {
+                System.err.println("Schedule is either too close to present or in the past");
+                System.exit(1);
+            }
+            builder.append(begin);
+            builder.append(';');
+        }
         builder.append("ts");
         builder.append(System.currentTimeMillis());
         builder.append(';');
+        //builder.append('\n');
+
         CRC32 crc32 = new CRC32();
         crc32.update(builder.toString().getBytes());
-     //   builder.insert(0, crc32.getValue());
+        //   builder.insert(0, crc32.getValue());
 //        byte[] hash = hexToByteArray(String.format("%08X", crc32.getValue()));
 
         sendcmd(builder.toString(),String.format("%08X", crc32.getValue()));
     }
     public static void main(String[] args) {
+        sync=false;
         HashMap<String, String> argTable = new HashMap<String, String>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i].charAt(0)) {
@@ -429,7 +599,14 @@ public class Scheduler
                         if (isoptValid(argTable, args[i].substring(2), true)) {
                             if (args[i].substring(2).equals("show")) {
                                 argTable.put(args[i].substring(2), "");
-                            } else {
+                            }
+                            else if (args[i].substring(2).equals("help")) {
+                                argTable.put(args[i].substring(2), "");
+                            }
+                            else if (args[i].substring(2).equals("sync")) {
+                                argTable.put(args[i].substring(2), "");
+                            }
+                            else {
                                 if (args.length - 1 == i) {
                                     System.err.println("`" + args[i] + "`" + " is missing an argument");
                                     exit(1);
@@ -438,7 +615,7 @@ public class Scheduler
                                 i++;
                             }
                         } else {
-                            System.err.println("`" + args[i] + "`" + " produce invalid combination");
+                            System.err.println("`" + args[i] + "`" + " is not a valid argument or produces invalid combination");
                             exit(1);
                         }
                     } else {
@@ -452,7 +629,14 @@ public class Scheduler
                             }
                             if (equiname.equals("show")) {
                                 argTable.put(equiname, "");
-                            } else {
+                            }
+                            else if(equiname.equals("help")){
+                                argTable.put(equiname, "");
+                            }
+                            else if(equiname.equals("sync")){
+                                argTable.put(equiname, "");
+                            }
+                            else {
                                 if (args.length - 1 == i) {
                                     System.err.println("`" + args[i] + "`" + " is missing an argument");
                                     exit(1);
@@ -461,7 +645,7 @@ public class Scheduler
                                 i++;
                             }
                         } else {
-                            System.err.println("`" + args[i] + "`" + " produce invalid combination");
+                            System.err.println("`" + args[i] + "`" + " is not a valid argument or produces invalid combination");
                             exit(1);
                         }
                     }
