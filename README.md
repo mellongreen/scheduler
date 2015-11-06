@@ -2,4 +2,4 @@
 Java scheduler client, to be used with schedule-handler   
 http://www.instructables.com/id/Arduino-controlled-power-supply/
 # License
-Lincensed under GPL lincese. See gpl.txt
+Lincensed under GPL lincese
